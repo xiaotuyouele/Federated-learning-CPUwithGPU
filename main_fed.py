@@ -21,7 +21,7 @@ from models.Fed import FedAvg
 from models.test import test_img
 
 
-SAVE_DIR = r"D:\GraduationDocuments"
+SAVE_DIR = "/content/save"
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs('./save', exist_ok=True)
 
