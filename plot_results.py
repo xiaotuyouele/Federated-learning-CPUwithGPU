@@ -12,7 +12,7 @@ from matplotlib.ticker import FuncFormatter, NullLocator
 # =========================================================
 # 1. 全局设置
 # =========================================================
-SAVE_DIR = r"D:\GraduationDocuments"
+SAVE_DIR = "/content/save"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 candidate_fonts = [
