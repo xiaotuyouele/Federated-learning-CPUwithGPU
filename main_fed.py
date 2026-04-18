@@ -353,7 +353,7 @@ if __name__ == '__main__':
     program_start_time = time.time()
 
     args = args_parser()
-    args.epochs = 25
+    args.epochs = 20
     print("args.epochs =", args.epochs)
 
     args.device = torch.device(
