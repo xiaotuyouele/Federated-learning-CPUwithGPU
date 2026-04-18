@@ -41,11 +41,11 @@ def generate_synthetic_dataset(args, seed=0):
     num_classes = args.num_classes
 
     # 类中心更近一些
-    centers = torch.randn(num_classes, input_size) * 2.0
+    centers = torch.randn(num_classes, input_size) * 0.25
 
     labels = torch.randint(0, num_classes, (num_samples,))
-    features = centers[labels] + 1.0 * torch.randn(num_samples, input_size)
-    noise_ratio = 0.10
+    features = centers[labels] + 3.2 * torch.randn(num_samples, input_size)
+    noise_ratio = 0.15
     noisy_mask = torch.rand(num_samples) < noise_ratio
     noisy_labels = torch.randint(0, num_classes, (num_samples,))
     labels[noisy_mask] = noisy_labels[noisy_mask]
