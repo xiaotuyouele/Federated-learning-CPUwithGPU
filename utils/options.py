@@ -40,7 +40,7 @@ def args_parser():
     parser.add_argument('--verbose', action='store_true', help='verbose print')
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: 1)')
     parser.add_argument('--all_clients', action='store_true', help='aggregation over all clients')
-    parser.add_argument('--input_size', type=int, default=5000, help='high-dim vector size')
+    parser.add_argument('--input_size', type=int, default=10000, help='high-dim vector size')
     parser.add_argument('--alpha', type=float, default=0.5, help='Dirichlet distribution parameter')
 
     args = parser.parse_args()
