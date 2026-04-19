@@ -25,6 +25,8 @@ SAVE_DIR = "/content/save"
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs('./save', exist_ok=True)
 
+FAIR_DIR = "/content/drive/MyDrive/fair_experiment"
+
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -40,7 +42,6 @@ def generate_synthetic_dataset(args, seed=0):
     input_size = args.input_size
     num_classes = args.num_classes
 
-    # 类中心更近一些
     centers = torch.randn(num_classes, input_size) * 0.25
 
     labels = torch.randint(0, num_classes, (num_samples,))
@@ -72,7 +73,6 @@ def build_dirichlet_split(dataset_train, num_users, num_classes, alpha, min_samp
 
     np.random.shuffle(idxs)
 
-    # 保底分配
     total_min_need = num_users * min_samples
     if total_min_need > len(idxs):
         raise ValueError("min_samples * num_users 超过训练集大小，请调小 min_samples 或 num_users")
@@ -173,10 +173,9 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     - acc 曲线
     - 每轮时间列表
     - 总训练时间
+    - time_detail（调度/本地训练/聚合/总轮次时间）
 
     exec_mode:
-        'cpu'    -> CPU-only：本地训练、聚合都在CPU
-        'gpu'    -> GPU-only：本地训练、聚合都尽量在GPU
         'collab' -> CPU-GPU协同：GPU本地训练，CPU聚合
     """
     if frac is None:
@@ -184,45 +183,31 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     if all_clients_flag is None:
         all_clients_flag = args.all_clients
 
-    # ==============================
-    # 设备设置
-    # ==============================
-    if exec_mode == 'cpu':
+    # 仅保留协同模式
+    if exec_mode != 'collab':
+        raise ValueError("这个版本仅保留协同模式，exec_mode 必须是 'collab'")
+
+    if torch.cuda.is_available() and args.gpu != -1:
+        train_device = torch.device(f'cuda:{args.gpu}')   # GPU负责训练
+        agg_device = torch.device('cpu')                  # CPU负责聚合
+    else:
+        print("GPU 不可用，协同模式自动退回 CPU-only")
         train_device = torch.device('cpu')
         agg_device = torch.device('cpu')
-    elif exec_mode == 'gpu':
-        if torch.cuda.is_available() and args.gpu != -1:
-            train_device = torch.device(f'cuda:{args.gpu}')
-            agg_device = torch.device(f'cuda:{args.gpu}')
-        else:
-            print("GPU 不可用，自动退回 CPU-only")
-            train_device = torch.device('cpu')
-            agg_device = torch.device('cpu')
-    elif exec_mode == 'collab':
-        if torch.cuda.is_available() and args.gpu != -1:
-            train_device = torch.device(f'cuda:{args.gpu}')   # GPU负责训练
-            agg_device = torch.device('cpu')                  # CPU负责聚合
-        else:
-            print("GPU 不可用，协同模式自动退回 CPU-only")
-            train_device = torch.device('cpu')
-            agg_device = torch.device('cpu')
-    else:
-        raise ValueError("exec_mode 必须是 'cpu'、'gpu' 或 'collab'")
 
-    # 构建全局模型
     old_device = args.device
     args.device = train_device
+
     net_glob = build_model(args, img_size)
 
-    FAIR_DIR = "/content/drive/MyDrive/fair_experiment"   # 如果你放在Drive
     init_state = torch.load(
         os.path.join(FAIR_DIR, f"init_model_seed{experiment_seed}.pth"),
         map_location=train_device
     )
     net_glob.load_state_dict(init_state)
 
-    if exec_mode == 'collab':
-        net_glob = net_glob.to(agg_device)
+    # 协同模式：全局模型主副本放在 CPU 聚合
+    net_glob = net_glob.to(agg_device)
 
     net_glob.train()
     w_glob = copy.deepcopy(net_glob.state_dict())
@@ -231,7 +216,6 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     acc_curve = []
     epoch_times = []
 
-    # 时间统计
     schedule_times = []
     local_train_times = []
     aggregation_times = []
@@ -251,7 +235,7 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
             w_locals = []
 
         # ==============================
-        # CPU：客户端调度
+        # 客户端调度（CPU）
         # ==============================
         schedule_start = time.time()
 
@@ -265,35 +249,20 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         schedule_times.append(time.time() - schedule_start)
 
         # ==============================
-        # 本地训练
+        # 本地训练（GPU）
         # ==============================
         local_train_start = time.time()
 
         for idx in idxs_users:
             local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
 
-            # 给客户端下发当前全局模型
-            if exec_mode == 'collab':
-                # CPU上的全局模型副本发到GPU训练
-                net_local = copy.deepcopy(net_glob).to(train_device)
-            else:
-                net_local = copy.deepcopy(net_glob).to(train_device)
+            # CPU上的全局模型副本发到GPU训练
+            net_local = copy.deepcopy(net_glob).to(train_device)
 
-            # GPU/CPU本地训练
             w, loss = local.train(net=net_local)
 
-            # ==============================
-            # 参数回传与存储
-            # ==============================
-            if exec_mode == 'collab':
-                # 协同模式：GPU训练完成 -> 参数拉回CPU -> CPU聚合
-                w_processed = {k: v.detach().cpu() for k, v in w.items()}
-            elif exec_mode == 'gpu':
-                # GPU-only：保持在GPU
-                w_processed = {k: v.detach().to(agg_device) for k, v in w.items()}
-            else:
-                # CPU-only：本来就在CPU
-                w_processed = {k: v.detach().cpu() for k, v in w.items()}
+            # GPU训练完成 -> 参数拉回CPU -> CPU聚合
+            w_processed = {k: v.detach().cpu() for k, v in w.items()}
 
             if all_clients_flag:
                 w_locals[idx] = copy.deepcopy(w_processed)
@@ -308,7 +277,7 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         local_train_times.append(time.time() - local_train_start)
 
         # ==============================
-        # CPU/GPU 聚合
+        # 聚合（CPU）
         # ==============================
         agg_start = time.time()
         w_glob = FedAvg(w_locals)
@@ -316,7 +285,7 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         aggregation_times.append(time.time() - agg_start)
 
         # ==============================
-        # 测试
+        # 测试（CPU）
         # ==============================
         loss_avg = sum(loss_locals) / len(loss_locals)
         loss_train.append(loss_avg)
@@ -335,9 +304,10 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
 
         if verbose:
             print(
-                "Round {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, "
+                "Round {:3d}, clients {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, "
                 "Schedule {:.2f}s, LocalTrain {:.2f}s, Aggregation {:.2f}s, Total {:.2f}s".format(
                     epoch + 1,
+                    len(idxs_users),
                     loss_avg,
                     acc_test,
                     schedule_times[-1],
@@ -349,7 +319,6 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
 
     total_train_time = time.time() - train_start_time
 
-    # 恢复原始 device
     args.device = old_device
 
     time_detail = {
@@ -360,6 +329,7 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     }
 
     return net_glob, loss_train, acc_curve, epoch_times, total_train_time, time_detail
+
 
 if __name__ == '__main__':
     program_start_time = time.time()
@@ -374,7 +344,7 @@ if __name__ == '__main__':
     )
 
     exec_mode = 'collab'
-    device_type = "CPU-GPU协同" if exec_mode == 'collab' else ("GPU" if exec_mode == 'gpu' else "CPU")
+    device_type = "CPU-GPU协同"
     print("当前设备:", device_type)
     print("device =", args.device)
 
@@ -410,10 +380,14 @@ if __name__ == '__main__':
     elif args.dataset == 'synthetic':
         experiment_seed = 0
 
-        FAIR_DIR = "/content/drive/MyDrive/fair_experiment"
-
-        dataset_train = torch.load(os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}.pt"))
-        dataset_test = torch.load(os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"))
+        dataset_train = torch.load(
+            os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}.pt"),
+            weights_only=False
+        )
+        dataset_test = torch.load(
+            os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"),
+            weights_only=False
+        )
         dict_users = np.load(
             os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
             allow_pickle=True
@@ -422,7 +396,7 @@ if __name__ == '__main__':
             os.path.join(FAIR_DIR, f"client_schedule_seed{experiment_seed}.npy"),
             allow_pickle=True
         )
-        
+
     else:
         exit('Error: unrecognized dataset')
 
@@ -443,18 +417,18 @@ if __name__ == '__main__':
     single_train_start = time.time()
 
     net_glob, loss_curve, acc_curve, epoch_times, total_train_time, time_detail = train_federated(
-    args=args,
-    dataset_train=dataset_train,
-    dataset_test=dataset_test,
-    dict_users=dict_users,
-    img_size=img_size,
-    client_schedule=client_schedule,
-    experiment_seed=experiment_seed,
-    frac=args.frac,
-    all_clients_flag=args.all_clients,
-    verbose=True,
-    exec_mode=exec_mode
-)
+        args=args,
+        dataset_train=dataset_train,
+        dataset_test=dataset_test,
+        dict_users=dict_users,
+        img_size=img_size,
+        client_schedule=client_schedule,
+        experiment_seed=experiment_seed,
+        frac=args.frac,
+        all_clients_flag=args.all_clients,
+        verbose=True,
+        exec_mode=exec_mode
+    )
 
     single_train_total_time = time.time() - single_train_start
 
@@ -468,6 +442,15 @@ if __name__ == '__main__':
     np.save(os.path.join(SAVE_DIR, "single_epoch_times.npy"), np.array(epoch_times))
     print("single_epoch_times.npy 已保存")
 
+    np.save(os.path.join(SAVE_DIR, "single_agg_times.npy"), np.array(time_detail["aggregation_times"]))
+    print("single_agg_times.npy 已保存")
+
+    np.save(os.path.join(SAVE_DIR, "single_schedule_times.npy"), np.array(time_detail["schedule_times"]))
+    print("single_schedule_times.npy 已保存")
+
+    np.save(os.path.join(SAVE_DIR, "single_local_train_times.npy"), np.array(time_detail["local_train_times"]))
+    print("single_local_train_times.npy 已保存")
+
     # loss 曲线
     plt.figure()
     plt.plot(range(1, len(loss_curve) + 1), loss_curve)
@@ -479,14 +462,10 @@ if __name__ == '__main__':
     ))
     plt.close()
 
-    # 测试
+    # 测试（协同模式在CPU测）
     test_device_backup = args.device
-
-    if exec_mode == 'collab':
-        args.device = torch.device('cpu')
-        net_glob = net_glob.to(args.device)
-    else:
-        net_glob = net_glob.to(args.device)
+    args.device = torch.device('cpu')
+    net_glob = net_glob.to(args.device)
 
     net_glob.eval()
     acc_train, loss_train_eval = test_img(net_glob, dataset_train, args)
@@ -507,6 +486,12 @@ if __name__ == '__main__':
         "avg_epoch_time_sec": float(np.mean(epoch_times)),
         "min_epoch_time_sec": float(np.min(epoch_times)),
         "max_epoch_time_sec": float(np.max(epoch_times)),
+        "avg_schedule_time_sec": float(np.mean(time_detail["schedule_times"])),
+        "avg_local_train_time_sec": float(np.mean(time_detail["local_train_times"])),
+        "avg_agg_time_sec": float(np.mean(time_detail["aggregation_times"])),
+        "min_agg_time_sec": float(np.min(time_detail["aggregation_times"])),
+        "max_agg_time_sec": float(np.max(time_detail["aggregation_times"])),
+        "total_agg_time_sec": float(np.sum(time_detail["aggregation_times"])),
         "final_train_acc": float(acc_train),
         "final_test_acc": float(acc_test)
     }
@@ -514,7 +499,7 @@ if __name__ == '__main__':
     print("single_time_summary.npy 已保存")
     np.save(os.path.join(SAVE_DIR, "single_time_detail.npy"), time_detail)
     print("single_time_detail.npy 已保存")
-    
+
     # =========================================================
     # 1) 多 α 实验：固定 frac，看 α 对最终精度和收敛曲线的影响
     # =========================================================
@@ -528,8 +513,9 @@ if __name__ == '__main__':
     alpha_results = {}
     alpha_time_results = {}
     alpha_run_times = {}
+    alpha_agg_time_results = {}
+    alpha_agg_run_times = {}
 
-    # 比较 α 时，必须真的走“采样部分客户端”的逻辑
     compare_all_clients_flag = False
 
     for alpha in alphas:
@@ -539,6 +525,7 @@ if __name__ == '__main__':
         acc_curves_alpha = []
         final_acc_list = []
         time_list_alpha = []
+        agg_time_list_alpha = []
 
         for run in range(runs_per_setting):
             run_start = time.time()
@@ -551,20 +538,24 @@ if __name__ == '__main__':
                     num_classes=args.num_classes,
                     alpha=alpha,
                     min_samples=1,
-                    seed=run
+                    seed=1000 + run
                 )
             else:
-                # 对 mnist/cifar，如果已有固定分法，就直接沿用
                 dict_users_run = copy.deepcopy(dict_users)
 
-            _, _, acc_curve_run, epoch_times_run, total_time_run, _ = train_federated(
+            client_schedule_run = np.load(
+                os.path.join(FAIR_DIR, f"client_schedule_seed{run}.npy"),
+                allow_pickle=True
+            )
+
+            _, _, acc_curve_run, epoch_times_run, total_time_run, time_detail_run = train_federated(
                 args=args,
                 dataset_train=dataset_train,
                 dataset_test=dataset_test,
                 dict_users=dict_users_run,
                 img_size=img_size,
-                client_schedule=client_schedule,
-                experiment_seed=experiment_seed,
+                client_schedule=client_schedule_run,
+                experiment_seed=run,
                 frac=args.frac,
                 all_clients_flag=compare_all_clients_flag,
                 verbose=False,
@@ -576,6 +567,7 @@ if __name__ == '__main__':
             acc_curves_alpha.append(acc_curve_run)
             final_acc_list.append(acc_curve_run[-1])
             time_list_alpha.append(total_time_run)
+            agg_time_list_alpha.append(float(np.sum(time_detail_run["aggregation_times"])))
 
             print("run {:2d}/{:2d}, final acc = {:.4f}, train_time = {:.2f}s, wall_time = {:.2f}s".format(
                 run + 1, runs_per_setting, acc_curve_run[-1], total_time_run, run_total_wall_time
@@ -594,6 +586,12 @@ if __name__ == '__main__':
         )
         alpha_run_times[alpha] = time_list_alpha
 
+        alpha_agg_time_results[alpha] = (
+            float(np.mean(agg_time_list_alpha)),
+            float(np.std(agg_time_list_alpha))
+        )
+        alpha_agg_run_times[alpha] = agg_time_list_alpha
+
         alpha_setting_total_time = time.time() - alpha_setting_start
 
         print("α={}, mean_acc={:.4f}, std_acc={:.4f}".format(
@@ -607,14 +605,15 @@ if __name__ == '__main__':
     np.save(os.path.join(SAVE_DIR, "results.npy"), alpha_results)
     np.save(os.path.join(SAVE_DIR, "alpha_time_results.npy"), alpha_time_results)
     np.save(os.path.join(SAVE_DIR, "alpha_run_times.npy"), alpha_run_times)
-    print("convergence.npy、results.npy、alpha_time_results.npy、alpha_run_times.npy 已保存")
+    np.save(os.path.join(SAVE_DIR, "alpha_agg_time_results.npy"), alpha_agg_time_results)
+    np.save(os.path.join(SAVE_DIR, "alpha_agg_run_times.npy"), alpha_agg_run_times)
+    print("convergence.npy、results.npy、alpha_time_results.npy、alpha_run_times.npy、alpha_agg_time_results.npy、alpha_agg_run_times.npy 已保存")
 
     multi_alpha_total_time = time.time() - multi_alpha_start
     print("Multi-alpha experiment 总时间: {:.2f} 秒".format(multi_alpha_total_time))
 
     # =========================================================
     # 2) 多 α + 多 frac 实验
-    # 每个 α、每个 run 重新生成一次该 α 下的数据分布，再比较不同 frac
     # =========================================================
     print("\n========== Multi-alpha + multi-frac experiment ==========")
     multi_alpha_frac_start = time.time()
@@ -627,24 +626,25 @@ if __name__ == '__main__':
     convergence_curves_frac = {}
     frac_time_results = {}
     frac_run_times = {}
+    frac_agg_time_results = {}
+    frac_agg_run_times = {}
 
-    # frac 对比时，不要走 all_clients
     compare_all_clients_flag = False
 
-    # 存每个(alpha, frac)的所有run结果
     pair_final_accs = {(a, f): [] for a in alphas_for_frac for f in fracs}
     pair_curves = {(a, f): [] for a in alphas_for_frac for f in fracs}
     pair_times = {(a, f): [] for a in alphas_for_frac for f in fracs}
+    pair_agg_times = {(a, f): [] for a in alphas_for_frac for f in fracs}
 
     for alpha_fixed in alphas_for_frac:
         print("\n===== α = {} =====".format(alpha_fixed))
         alpha_fixed_start = time.time()
 
         for run in range(runs_per_setting):
+            seed_id = run
             set_seed(1000 + run)
 
             if args.dataset == 'synthetic':
-                # 同一个 alpha、同一个 run 下，先固定一次分布
                 dict_users_run = build_dirichlet_split(
                     dataset_train=dataset_train,
                     num_users=args.num_users,
@@ -656,18 +656,23 @@ if __name__ == '__main__':
             else:
                 dict_users_run = copy.deepcopy(dict_users)
 
+            client_schedule_run = np.load(
+                os.path.join(FAIR_DIR, f"client_schedule_seed{seed_id}.npy"),
+                allow_pickle=True
+            )
+
             for frac in fracs:
                 pair_start = time.time()
                 print("alpha={}, frac={}, run={}".format(alpha_fixed, frac, run + 1))
 
-                _, _, acc_curve_run, epoch_times_run, total_time_run, _ = train_federated(
+                _, _, acc_curve_run, epoch_times_run, total_time_run, time_detail_run = train_federated(
                     args=args,
                     dataset_train=dataset_train,
                     dataset_test=dataset_test,
                     dict_users=dict_users_run,
                     img_size=img_size,
-                    client_schedule=client_schedule,
-                    experiment_seed=experiment_seed,
+                    client_schedule=client_schedule_run,
+                    experiment_seed=seed_id,
                     frac=frac,
                     all_clients_flag=compare_all_clients_flag,
                     verbose=False,
@@ -679,6 +684,7 @@ if __name__ == '__main__':
                 pair_final_accs[(alpha_fixed, frac)].append(acc_curve_run[-1])
                 pair_curves[(alpha_fixed, frac)].append(acc_curve_run)
                 pair_times[(alpha_fixed, frac)].append(total_time_run)
+                pair_agg_times[(alpha_fixed, frac)].append(float(np.sum(time_detail_run["aggregation_times"])))
 
                 print("final acc = {:.4f}, train_time = {:.2f}s, wall_time = {:.2f}s".format(
                     acc_curve_run[-1], total_time_run, pair_wall_time
@@ -692,6 +698,7 @@ if __name__ == '__main__':
             final_accs = pair_final_accs[(alpha_fixed, frac)]
             curves = pair_curves[(alpha_fixed, frac)]
             times_list = pair_times[(alpha_fixed, frac)]
+            agg_times_list = pair_agg_times[(alpha_fixed, frac)]
 
             frac_results[(alpha_fixed, frac)] = (
                 float(np.mean(final_accs)),
@@ -703,6 +710,12 @@ if __name__ == '__main__':
                 float(np.std(times_list))
             )
             frac_run_times[(alpha_fixed, frac)] = times_list
+
+            frac_agg_time_results[(alpha_fixed, frac)] = (
+                float(np.mean(agg_times_list)),
+                float(np.std(agg_times_list))
+            )
+            frac_agg_run_times[(alpha_fixed, frac)] = agg_times_list
 
             print("α={}, frac={}, mean_acc={:.4f}, std_acc={:.4f}, mean_time={:.2f}s, std_time={:.2f}s".format(
                 alpha_fixed,
@@ -717,7 +730,9 @@ if __name__ == '__main__':
     np.save(os.path.join(SAVE_DIR, "convergence_frac.npy"), convergence_curves_frac)
     np.save(os.path.join(SAVE_DIR, "frac_time_results.npy"), frac_time_results)
     np.save(os.path.join(SAVE_DIR, "frac_run_times.npy"), frac_run_times)
-    print("frac_results.npy、convergence_frac.npy、frac_time_results.npy、frac_run_times.npy 已保存")
+    np.save(os.path.join(SAVE_DIR, "frac_agg_time_results.npy"), frac_agg_time_results)
+    np.save(os.path.join(SAVE_DIR, "frac_agg_run_times.npy"), frac_agg_run_times)
+    print("frac_results.npy、convergence_frac.npy、frac_time_results.npy、frac_run_times.npy、frac_agg_time_results.npy、frac_agg_run_times.npy 已保存")
 
     multi_alpha_frac_total_time = time.time() - multi_alpha_frac_start
     print("Multi-alpha + multi-frac experiment 总时间: {:.2f} 秒".format(multi_alpha_frac_total_time))
@@ -729,7 +744,8 @@ if __name__ == '__main__':
         "single_training_block_time_sec": float(single_train_total_time),
         "multi_alpha_time_sec": float(multi_alpha_total_time),
         "multi_alpha_frac_time_sec": float(multi_alpha_frac_total_time),
-        "program_total_time_sec": float(program_total_time)
+        "program_total_time_sec": float(program_total_time),
+        "single_total_agg_time_sec": float(np.sum(time_detail["aggregation_times"]))
     }
     np.save(os.path.join(SAVE_DIR, "overall_time_summary.npy"), overall_time_summary)
 
