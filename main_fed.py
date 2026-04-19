@@ -164,50 +164,28 @@ def build_model(args, img_size):
 
 def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
                     client_schedule, experiment_seed,
-                    frac=None, all_clients_flag=None, verbose=True,
-                    exec_mode='collab'):
+                    frac=None, all_clients_flag=None, verbose=True):
     """
     执行一次联邦训练，返回：
     - 最终模型
     - loss 曲线
     - acc 曲线
     - 每轮时间列表
+    - 每轮聚合时间列表
     - 总训练时间
-    - time_detail（调度/本地训练/聚合/总轮次时间）
-
-    exec_mode:
-        'collab' -> CPU-GPU协同：GPU本地训练，CPU聚合
     """
     if frac is None:
         frac = args.frac
     if all_clients_flag is None:
         all_clients_flag = args.all_clients
 
-    # 仅保留协同模式
-    if exec_mode != 'collab':
-        raise ValueError("这个版本仅保留协同模式，exec_mode 必须是 'collab'")
-
-    if torch.cuda.is_available() and args.gpu != -1:
-        train_device = torch.device(f'cuda:{args.gpu}')   # GPU负责训练
-        agg_device = torch.device('cpu')                  # CPU负责聚合
-    else:
-        print("GPU 不可用，协同模式自动退回 CPU-only")
-        train_device = torch.device('cpu')
-        agg_device = torch.device('cpu')
-
-    old_device = args.device
-    args.device = train_device
-
     net_glob = build_model(args, img_size)
 
     init_state = torch.load(
         os.path.join(FAIR_DIR, f"init_model_seed{experiment_seed}.pth"),
-        map_location=train_device
+        map_location=args.device
     )
     net_glob.load_state_dict(init_state)
-
-    # 协同模式：全局模型主副本放在 CPU 聚合
-    net_glob = net_glob.to(agg_device)
 
     net_glob.train()
     w_glob = copy.deepcopy(net_glob.state_dict())
@@ -215,10 +193,7 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     loss_train = []
     acc_curve = []
     epoch_times = []
-
-    schedule_times = []
-    local_train_times = []
-    aggregation_times = []
+    agg_times = []
 
     if all_clients_flag:
         if verbose:
@@ -234,11 +209,6 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         if not all_clients_flag:
             w_locals = []
 
-        # ==============================
-        # 客户端调度（CPU）
-        # ==============================
-        schedule_start = time.time()
-
         if all_clients_flag:
             idxs_users = list(range(args.num_users))
         else:
@@ -246,56 +216,28 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
             epoch_order = list(client_schedule[epoch])
             idxs_users = epoch_order[:m]
 
-        schedule_times.append(time.time() - schedule_start)
-
-        # ==============================
-        # 本地训练（GPU）
-        # ==============================
-        local_train_start = time.time()
-
         for idx in idxs_users:
             local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
-
-            # CPU上的全局模型副本发到GPU训练
-            net_local = copy.deepcopy(net_glob).to(train_device)
-
-            w, loss = local.train(net=net_local)
-
-            # GPU训练完成 -> 参数拉回CPU -> CPU聚合
-            w_processed = {k: v.detach().cpu() for k, v in w.items()}
+            w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
 
             if all_clients_flag:
-                w_locals[idx] = copy.deepcopy(w_processed)
+                w_locals[idx] = copy.deepcopy(w)
             else:
-                w_locals.append(copy.deepcopy(w_processed))
+                w_locals.append(copy.deepcopy(w))
 
             loss_locals.append(copy.deepcopy(loss))
 
-            if train_device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-        local_train_times.append(time.time() - local_train_start)
-
-        # ==============================
-        # 聚合（CPU）
-        # ==============================
-        agg_start = time.time()
+        agg_start_time = time.time()
         w_glob = FedAvg(w_locals)
         net_glob.load_state_dict(w_glob)
-        aggregation_times.append(time.time() - agg_start)
+        agg_time = time.time() - agg_start_time
+        agg_times.append(agg_time)
 
-        # ==============================
-        # 测试（CPU）
-        # ==============================
         loss_avg = sum(loss_locals) / len(loss_locals)
         loss_train.append(loss_avg)
 
         net_glob.eval()
-        test_device_old = args.device
-        args.device = agg_device
         acc_test, _ = test_img(net_glob, dataset_test, args)
-        args.device = test_device_old
-
         acc_curve.append(acc_test)
         net_glob.train()
 
@@ -304,31 +246,14 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
 
         if verbose:
             print(
-                "Round {:3d}, clients {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, "
-                "Schedule {:.2f}s, LocalTrain {:.2f}s, Aggregation {:.2f}s, Total {:.2f}s".format(
-                    epoch + 1,
-                    len(idxs_users),
-                    loss_avg,
-                    acc_test,
-                    schedule_times[-1],
-                    local_train_times[-1],
-                    aggregation_times[-1],
-                    epoch_time
+                'Round {:3d}, clients {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, Epoch Time {:.2f}s, Agg Time {:.4f}s'.format(
+                    epoch + 1, len(idxs_users), loss_avg, acc_test, epoch_time, agg_time
                 )
             )
 
     total_train_time = time.time() - train_start_time
 
-    args.device = old_device
-
-    time_detail = {
-        "schedule_times": schedule_times,
-        "local_train_times": local_train_times,
-        "aggregation_times": aggregation_times,
-        "epoch_times": epoch_times
-    }
-
-    return net_glob, loss_train, acc_curve, epoch_times, total_train_time, time_detail
+    return net_glob, loss_train, acc_curve, epoch_times, agg_times, total_train_time
 
 
 if __name__ == '__main__':
@@ -343,8 +268,7 @@ if __name__ == '__main__':
         'cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu'
     )
 
-    exec_mode = 'collab'
-    device_type = "CPU-GPU协同"
+    device_type = "GPU" if torch.cuda.is_available() and args.gpu != -1 else "CPU"
     print("当前设备:", device_type)
     print("device =", args.device)
 
@@ -388,14 +312,17 @@ if __name__ == '__main__':
             os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"),
             weights_only=False
         )
-        dict_users = np.load(
-            os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
-            allow_pickle=True
-        ).item()
-        client_schedule = np.load(
-            os.path.join(FAIR_DIR, f"client_schedule_seed{experiment_seed}.npy"),
-            allow_pickle=True
-        )
+
+        if args.iid:
+            dict_users = np.load(
+                os.path.join(FAIR_DIR, f"dict_users_iid_seed{experiment_seed}.npy"),
+                allow_pickle=True
+            ).item()
+        else:
+            dict_users = np.load(
+                os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
+                allow_pickle=True
+            ).item()
 
     else:
         exit('Error: unrecognized dataset')
@@ -404,6 +331,13 @@ if __name__ == '__main__':
     print("数据准备完成，用时: {:.2f} 秒".format(data_prepare_time))
 
     img_size = dataset_train[0][0].shape
+
+    # ===== 固定公平实验资源 =====
+    fixed_experiment_seed = 0
+    client_schedule_fixed = np.load(
+        os.path.join(FAIR_DIR, "client_schedule_seed0.npy"),
+        allow_pickle=True
+    )
 
     # ===== 打印客户端样本量 =====
     print("========== Client sample statistics ==========")
@@ -416,18 +350,17 @@ if __name__ == '__main__':
     print("\n========== Single training ==========")
     single_train_start = time.time()
 
-    net_glob, loss_curve, acc_curve, epoch_times, total_train_time, time_detail = train_federated(
+    net_glob, loss_curve, acc_curve, epoch_times, agg_times, total_train_time = train_federated(
         args=args,
         dataset_train=dataset_train,
         dataset_test=dataset_test,
         dict_users=dict_users,
         img_size=img_size,
-        client_schedule=client_schedule,
-        experiment_seed=experiment_seed,
+        client_schedule=client_schedule_fixed,
+        experiment_seed=fixed_experiment_seed,
         frac=args.frac,
         all_clients_flag=args.all_clients,
-        verbose=True,
-        exec_mode=exec_mode
+        verbose=True
     )
 
     single_train_total_time = time.time() - single_train_start
@@ -438,18 +371,15 @@ if __name__ == '__main__':
     print("平均每轮时间: {:.2f} 秒/epoch".format(np.mean(epoch_times)))
     print("最快轮次时间: {:.2f} 秒".format(np.min(epoch_times)))
     print("最慢轮次时间: {:.2f} 秒".format(np.max(epoch_times)))
+    print("平均每轮聚合时间: {:.4f} 秒/epoch".format(np.mean(agg_times)))
+    print("最快聚合时间: {:.4f} 秒".format(np.min(agg_times)))
+    print("最慢聚合时间: {:.4f} 秒".format(np.max(agg_times)))
 
     np.save(os.path.join(SAVE_DIR, "single_epoch_times.npy"), np.array(epoch_times))
     print("single_epoch_times.npy 已保存")
 
-    np.save(os.path.join(SAVE_DIR, "single_agg_times.npy"), np.array(time_detail["aggregation_times"]))
+    np.save(os.path.join(SAVE_DIR, "single_agg_times.npy"), np.array(agg_times))
     print("single_agg_times.npy 已保存")
-
-    np.save(os.path.join(SAVE_DIR, "single_schedule_times.npy"), np.array(time_detail["schedule_times"]))
-    print("single_schedule_times.npy 已保存")
-
-    np.save(os.path.join(SAVE_DIR, "single_local_train_times.npy"), np.array(time_detail["local_train_times"]))
-    print("single_local_train_times.npy 已保存")
 
     # loss 曲线
     plt.figure()
@@ -462,16 +392,10 @@ if __name__ == '__main__':
     ))
     plt.close()
 
-    # 测试（协同模式在CPU测）
-    test_device_backup = args.device
-    args.device = torch.device('cpu')
-    net_glob = net_glob.to(args.device)
-
+    # 测试
     net_glob.eval()
     acc_train, loss_train_eval = test_img(net_glob, dataset_train, args)
     acc_test, loss_test = test_img(net_glob, dataset_test, args)
-
-    args.device = test_device_backup
     print("Training accuracy: {:.4f}".format(acc_train))
     print("Testing accuracy: {:.4f}".format(acc_test))
 
@@ -486,19 +410,15 @@ if __name__ == '__main__':
         "avg_epoch_time_sec": float(np.mean(epoch_times)),
         "min_epoch_time_sec": float(np.min(epoch_times)),
         "max_epoch_time_sec": float(np.max(epoch_times)),
-        "avg_schedule_time_sec": float(np.mean(time_detail["schedule_times"])),
-        "avg_local_train_time_sec": float(np.mean(time_detail["local_train_times"])),
-        "avg_agg_time_sec": float(np.mean(time_detail["aggregation_times"])),
-        "min_agg_time_sec": float(np.min(time_detail["aggregation_times"])),
-        "max_agg_time_sec": float(np.max(time_detail["aggregation_times"])),
-        "total_agg_time_sec": float(np.sum(time_detail["aggregation_times"])),
+        "avg_agg_time_sec": float(np.mean(agg_times)),
+        "min_agg_time_sec": float(np.min(agg_times)),
+        "max_agg_time_sec": float(np.max(agg_times)),
+        "total_agg_time_sec": float(np.sum(agg_times)),
         "final_train_acc": float(acc_train),
         "final_test_acc": float(acc_test)
     }
     np.save(os.path.join(SAVE_DIR, "single_time_summary.npy"), single_time_summary)
     print("single_time_summary.npy 已保存")
-    np.save(os.path.join(SAVE_DIR, "single_time_detail.npy"), time_detail)
-    print("single_time_detail.npy 已保存")
 
     # =========================================================
     # 1) 多 α 实验：固定 frac，看 α 对最终精度和收敛曲线的影响
@@ -529,7 +449,7 @@ if __name__ == '__main__':
 
         for run in range(runs_per_setting):
             run_start = time.time()
-            set_seed(run)
+            set_seed(1000 + run)
 
             if args.dataset == 'synthetic':
                 dict_users_run = build_dirichlet_split(
@@ -543,23 +463,17 @@ if __name__ == '__main__':
             else:
                 dict_users_run = copy.deepcopy(dict_users)
 
-            client_schedule_run = np.load(
-                os.path.join(FAIR_DIR, f"client_schedule_seed{run}.npy"),
-                allow_pickle=True
-            )
-
-            _, _, acc_curve_run, epoch_times_run, total_time_run, time_detail_run = train_federated(
+            _, _, acc_curve_run, epoch_times_run, agg_times_run, total_time_run = train_federated(
                 args=args,
                 dataset_train=dataset_train,
                 dataset_test=dataset_test,
                 dict_users=dict_users_run,
                 img_size=img_size,
-                client_schedule=client_schedule_run,
-                experiment_seed=run,
+                client_schedule=client_schedule_fixed,
+                experiment_seed=fixed_experiment_seed,
                 frac=args.frac,
                 all_clients_flag=compare_all_clients_flag,
-                verbose=False,
-                exec_mode=exec_mode
+                verbose=False
             )
 
             run_total_wall_time = time.time() - run_start
@@ -567,7 +481,7 @@ if __name__ == '__main__':
             acc_curves_alpha.append(acc_curve_run)
             final_acc_list.append(acc_curve_run[-1])
             time_list_alpha.append(total_time_run)
-            agg_time_list_alpha.append(float(np.sum(time_detail_run["aggregation_times"])))
+            agg_time_list_alpha.append(float(np.sum(agg_times_run)))
 
             print("run {:2d}/{:2d}, final acc = {:.4f}, train_time = {:.2f}s, wall_time = {:.2f}s".format(
                 run + 1, runs_per_setting, acc_curve_run[-1], total_time_run, run_total_wall_time
@@ -599,6 +513,9 @@ if __name__ == '__main__':
         ))
         print("α={}, mean_time={:.2f}s, std_time={:.2f}s, setting_total_wall_time={:.2f}s".format(
             alpha, alpha_time_results[alpha][0], alpha_time_results[alpha][1], alpha_setting_total_time
+        ))
+        print("α={}, mean_agg_time={:.4f}s, std_agg_time={:.4f}s".format(
+            alpha, alpha_agg_time_results[alpha][0], alpha_agg_time_results[alpha][1]
         ))
 
     np.save(os.path.join(SAVE_DIR, "convergence.npy"), convergence_curves)
@@ -641,7 +558,6 @@ if __name__ == '__main__':
         alpha_fixed_start = time.time()
 
         for run in range(runs_per_setting):
-            seed_id = run
             set_seed(1000 + run)
 
             if args.dataset == 'synthetic':
@@ -656,27 +572,21 @@ if __name__ == '__main__':
             else:
                 dict_users_run = copy.deepcopy(dict_users)
 
-            client_schedule_run = np.load(
-                os.path.join(FAIR_DIR, f"client_schedule_seed{seed_id}.npy"),
-                allow_pickle=True
-            )
-
             for frac in fracs:
                 pair_start = time.time()
                 print("alpha={}, frac={}, run={}".format(alpha_fixed, frac, run + 1))
 
-                _, _, acc_curve_run, epoch_times_run, total_time_run, time_detail_run = train_federated(
+                _, _, acc_curve_run, epoch_times_run, agg_times_run, total_time_run = train_federated(
                     args=args,
                     dataset_train=dataset_train,
                     dataset_test=dataset_test,
                     dict_users=dict_users_run,
                     img_size=img_size,
-                    client_schedule=client_schedule_run,
-                    experiment_seed=seed_id,
+                    client_schedule=client_schedule_fixed,
+                    experiment_seed=fixed_experiment_seed,
                     frac=frac,
                     all_clients_flag=compare_all_clients_flag,
-                    verbose=False,
-                    exec_mode=exec_mode
+                    verbose=False
                 )
 
                 pair_wall_time = time.time() - pair_start
@@ -684,7 +594,7 @@ if __name__ == '__main__':
                 pair_final_accs[(alpha_fixed, frac)].append(acc_curve_run[-1])
                 pair_curves[(alpha_fixed, frac)].append(acc_curve_run)
                 pair_times[(alpha_fixed, frac)].append(total_time_run)
-                pair_agg_times[(alpha_fixed, frac)].append(float(np.sum(time_detail_run["aggregation_times"])))
+                pair_agg_times[(alpha_fixed, frac)].append(float(np.sum(agg_times_run)))
 
                 print("final acc = {:.4f}, train_time = {:.2f}s, wall_time = {:.2f}s".format(
                     acc_curve_run[-1], total_time_run, pair_wall_time
@@ -704,6 +614,7 @@ if __name__ == '__main__':
                 float(np.mean(final_accs)),
                 float(np.std(final_accs))
             )
+
             convergence_curves_frac[(alpha_fixed, frac)] = np.mean(np.array(curves), axis=0)
             frac_time_results[(alpha_fixed, frac)] = (
                 float(np.mean(times_list)),
@@ -717,13 +628,15 @@ if __name__ == '__main__':
             )
             frac_agg_run_times[(alpha_fixed, frac)] = agg_times_list
 
-            print("α={}, frac={}, mean_acc={:.4f}, std_acc={:.4f}, mean_time={:.2f}s, std_time={:.2f}s".format(
+            print("α={}, frac={}, mean_acc={:.4f}, std_acc={:.4f}, mean_time={:.2f}s, std_time={:.2f}s, mean_agg_time={:.4f}s, std_agg_time={:.4f}s".format(
                 alpha_fixed,
                 frac,
                 frac_results[(alpha_fixed, frac)][0],
                 frac_results[(alpha_fixed, frac)][1],
                 frac_time_results[(alpha_fixed, frac)][0],
-                frac_time_results[(alpha_fixed, frac)][1]
+                frac_time_results[(alpha_fixed, frac)][1],
+                frac_agg_time_results[(alpha_fixed, frac)][0],
+                frac_agg_time_results[(alpha_fixed, frac)][1]
             ))
 
     np.save(os.path.join(SAVE_DIR, "frac_results.npy"), frac_results)
@@ -745,7 +658,7 @@ if __name__ == '__main__':
         "multi_alpha_time_sec": float(multi_alpha_total_time),
         "multi_alpha_frac_time_sec": float(multi_alpha_frac_total_time),
         "program_total_time_sec": float(program_total_time),
-        "single_total_agg_time_sec": float(np.sum(time_detail["aggregation_times"]))
+        "single_total_agg_time_sec": float(np.sum(agg_times))
     }
     np.save(os.path.join(SAVE_DIR, "overall_time_summary.npy"), overall_time_summary)
 
