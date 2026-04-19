@@ -163,6 +163,7 @@ def build_model(args, img_size):
 
 
 def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
+                    client_schedule, experiment_seed,
                     frac=None, all_clients_flag=None, verbose=True,
                     exec_mode='collab'):
     """
@@ -213,7 +214,13 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     args.device = train_device
     net_glob = build_model(args, img_size)
 
-    # 如果聚合设备和训练设备不同，协同模式下全局模型主副本放在 CPU
+    FAIR_DIR = "/content/drive/MyDrive/fair_experiment"   # 如果你放在Drive
+    init_state = torch.load(
+        os.path.join(FAIR_DIR, f"init_model_seed{experiment_seed}.pth"),
+        map_location=train_device
+    )
+    net_glob.load_state_dict(init_state)
+
     if exec_mode == 'collab':
         net_glob = net_glob.to(agg_device)
 
@@ -247,8 +254,14 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         # CPU：客户端调度
         # ==============================
         schedule_start = time.time()
-        m = max(int(frac * args.num_users), 1)
-        idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+
+        if all_clients_flag:
+            idxs_users = list(range(args.num_users))
+        else:
+            m = max(int(frac * args.num_users), 1)
+            epoch_order = list(client_schedule[epoch])
+            idxs_users = epoch_order[:m]
+
         schedule_times.append(time.time() - schedule_start)
 
         # ==============================
@@ -395,19 +408,21 @@ if __name__ == '__main__':
             raise ValueError("当前代码未为 CIFAR 写 Dirichlet 非IID 划分，可先用 synthetic 或 mnist")
 
     elif args.dataset == 'synthetic':
-        dataset_train, dataset_test = generate_synthetic_dataset(args, seed=0)
+        experiment_seed = 0
 
-        if args.iid:
-            dict_users = build_iid_split(dataset_train, args.num_users, seed=0)
-        else:
-            dict_users = build_dirichlet_split(
-                dataset_train=dataset_train,
-                num_users=args.num_users,
-                num_classes=args.num_classes,
-                alpha=args.alpha,
-                min_samples=1,
-                seed=0
-            )
+        FAIR_DIR = "/content/drive/MyDrive/fair_experiment"
+
+        dataset_train = torch.load(os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}.pt"))
+        dataset_test = torch.load(os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"))
+        dict_users = np.load(
+            os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
+            allow_pickle=True
+        ).item()
+        client_schedule = np.load(
+            os.path.join(FAIR_DIR, f"client_schedule_seed{experiment_seed}.npy"),
+            allow_pickle=True
+        )
+        
     else:
         exit('Error: unrecognized dataset')
 
@@ -433,10 +448,12 @@ if __name__ == '__main__':
     dataset_test=dataset_test,
     dict_users=dict_users,
     img_size=img_size,
+    client_schedule=client_schedule,
+    experiment_seed=experiment_seed,
     frac=args.frac,
     all_clients_flag=args.all_clients,
     verbose=True,
-    exec_mode='collab'
+    exec_mode=exec_mode
 )
 
     single_train_total_time = time.time() - single_train_start
@@ -541,16 +558,18 @@ if __name__ == '__main__':
                 dict_users_run = copy.deepcopy(dict_users)
 
             _, _, acc_curve_run, epoch_times_run, total_time_run, _ = train_federated(
-            args=args,
-            dataset_train=dataset_train,
-            dataset_test=dataset_test,
-            dict_users=dict_users_run,
-            img_size=img_size,
-            frac=args.frac,
-            all_clients_flag=compare_all_clients_flag,
-            verbose=False,
-            exec_mode='collab'
-)
+                args=args,
+                dataset_train=dataset_train,
+                dataset_test=dataset_test,
+                dict_users=dict_users_run,
+                img_size=img_size,
+                client_schedule=client_schedule,
+                experiment_seed=experiment_seed,
+                frac=args.frac,
+                all_clients_flag=compare_all_clients_flag,
+                verbose=False,
+                exec_mode=exec_mode
+            )
 
             run_total_wall_time = time.time() - run_start
 
@@ -647,10 +666,12 @@ if __name__ == '__main__':
                     dataset_test=dataset_test,
                     dict_users=dict_users_run,
                     img_size=img_size,
+                    client_schedule=client_schedule,
+                    experiment_seed=experiment_seed,
                     frac=frac,
                     all_clients_flag=compare_all_clients_flag,
                     verbose=False,
-                    exec_mode='collab'
+                    exec_mode=exec_mode
                 )
 
                 pair_wall_time = time.time() - pair_start
