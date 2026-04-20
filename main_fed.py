@@ -170,9 +170,12 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     - 最终模型
     - loss 曲线
     - acc 曲线
-    - 每轮时间列表
-    - 每轮聚合时间列表
+    - 每轮总时间列表 epoch_times
+    - 每轮聚合时间列表 agg_times
+    - 每轮本地训练总时间列表 local_train_times
+    - 每轮调度时间列表 schedule_times
     - 总训练时间
+    - 单次训练详细时间字典 time_detail
     """
     if frac is None:
         frac = args.frac
@@ -194,6 +197,17 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
     acc_curve = []
     epoch_times = []
     agg_times = []
+    local_train_times = []
+    schedule_times = []
+
+    # 详细时间明细
+    time_detail = {
+        "epoch_times_sec": [],
+        "agg_times_sec": [],
+        "local_train_times_sec": [],
+        "schedule_times_sec": [],
+        "selected_clients_per_epoch": [],
+    }
 
     if all_clients_flag:
         if verbose:
@@ -209,12 +223,25 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         if not all_clients_flag:
             w_locals = []
 
+        # =====================
+        # 1) 调度时间
+        # =====================
+        schedule_start_time = time.time()
+
         if all_clients_flag:
             idxs_users = list(range(args.num_users))
         else:
             m = max(int(frac * args.num_users), 1)
             epoch_order = list(client_schedule[epoch])
             idxs_users = epoch_order[:m]
+
+        schedule_time = time.time() - schedule_start_time
+        schedule_times.append(schedule_time)
+
+        # =====================
+        # 2) 本地训练时间
+        # =====================
+        local_train_start_time = time.time()
 
         for idx in idxs_users:
             local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
@@ -227,12 +254,21 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
 
             loss_locals.append(copy.deepcopy(loss))
 
+        local_train_time = time.time() - local_train_start_time
+        local_train_times.append(local_train_time)
+
+        # =====================
+        # 3) 聚合时间
+        # =====================
         agg_start_time = time.time()
         w_glob = FedAvg(w_locals)
         net_glob.load_state_dict(w_glob)
         agg_time = time.time() - agg_start_time
         agg_times.append(agg_time)
 
+        # =====================
+        # 4) loss / acc
+        # =====================
         loss_avg = sum(loss_locals) / len(loss_locals)
         loss_train.append(loss_avg)
 
@@ -241,19 +277,66 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         acc_curve.append(acc_test)
         net_glob.train()
 
+        # =====================
+        # 5) 本轮总时间
+        # =====================
         epoch_time = time.time() - epoch_start_time
         epoch_times.append(epoch_time)
 
+        # =====================
+        # 6) 详细时间记录
+        # =====================
+        time_detail["epoch_times_sec"].append(float(epoch_time))
+        time_detail["agg_times_sec"].append(float(agg_time))
+        time_detail["local_train_times_sec"].append(float(local_train_time))
+        time_detail["schedule_times_sec"].append(float(schedule_time))
+        time_detail["selected_clients_per_epoch"].append(int(len(idxs_users)))
+
         if verbose:
             print(
-                'Round {:3d}, clients {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, Epoch Time {:.2f}s, Agg Time {:.4f}s'.format(
-                    epoch + 1, len(idxs_users), loss_avg, acc_test, epoch_time, agg_time
+                'Round {:3d}, clients {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, '
+                'Epoch Time {:.2f}s, Local Train Time {:.2f}s, Schedule Time {:.6f}s, Agg Time {:.4f}s'.format(
+                    epoch + 1, len(idxs_users), loss_avg, acc_test,
+                    epoch_time, local_train_time, schedule_time, agg_time
                 )
             )
 
     total_train_time = time.time() - train_start_time
 
-    return net_glob, loss_train, acc_curve, epoch_times, agg_times, total_train_time
+    # =====================
+    # 7) 汇总信息
+    # =====================
+    time_detail["total_train_time_sec"] = float(total_train_time)
+    time_detail["total_epoch_time_sec"] = float(np.sum(epoch_times))
+    time_detail["total_local_train_time_sec"] = float(np.sum(local_train_times))
+    time_detail["total_schedule_time_sec"] = float(np.sum(schedule_times))
+    time_detail["total_agg_time_sec"] = float(np.sum(agg_times))
+
+    time_detail["avg_epoch_time_sec"] = float(np.mean(epoch_times))
+    time_detail["avg_local_train_time_sec"] = float(np.mean(local_train_times))
+    time_detail["avg_schedule_time_sec"] = float(np.mean(schedule_times))
+    time_detail["avg_agg_time_sec"] = float(np.mean(agg_times))
+
+    time_detail["min_epoch_time_sec"] = float(np.min(epoch_times))
+    time_detail["max_epoch_time_sec"] = float(np.max(epoch_times))
+    time_detail["min_local_train_time_sec"] = float(np.min(local_train_times))
+    time_detail["max_local_train_time_sec"] = float(np.max(local_train_times))
+    time_detail["min_schedule_time_sec"] = float(np.min(schedule_times))
+    time_detail["max_schedule_time_sec"] = float(np.max(schedule_times))
+    time_detail["min_agg_time_sec"] = float(np.min(agg_times))
+    time_detail["max_agg_time_sec"] = float(np.max(agg_times))
+
+    return (
+        net_glob,
+        loss_train,
+        acc_curve,
+        epoch_times,
+        agg_times,
+        local_train_times,
+        schedule_times,
+        total_train_time,
+        time_detail
+    )
 
 
 if __name__ == '__main__':
@@ -350,7 +433,17 @@ if __name__ == '__main__':
     print("\n========== Single training ==========")
     single_train_start = time.time()
 
-    net_glob, loss_curve, acc_curve, epoch_times, agg_times, total_train_time = train_federated(
+    (
+        net_glob,
+        loss_curve,
+        acc_curve,
+        epoch_times,
+        agg_times,
+        local_train_times,
+        schedule_times,
+        total_train_time,
+        single_time_detail
+    ) = train_federated(
         args=args,
         dataset_train=dataset_train,
         dataset_test=dataset_test,
@@ -368,9 +461,19 @@ if __name__ == '__main__':
     print("\n========== Single training time statistics ==========")
     print("单次训练总时间: {:.2f} 秒".format(total_train_time))
     print("单次训练外层总耗时: {:.2f} 秒".format(single_train_total_time))
+
     print("平均每轮时间: {:.2f} 秒/epoch".format(np.mean(epoch_times)))
     print("最快轮次时间: {:.2f} 秒".format(np.min(epoch_times)))
     print("最慢轮次时间: {:.2f} 秒".format(np.max(epoch_times)))
+
+    print("平均每轮本地训练时间: {:.2f} 秒/epoch".format(np.mean(local_train_times)))
+    print("最快本地训练时间: {:.2f} 秒".format(np.min(local_train_times)))
+    print("最慢本地训练时间: {:.2f} 秒".format(np.max(local_train_times)))
+
+    print("平均每轮调度时间: {:.6f} 秒/epoch".format(np.mean(schedule_times)))
+    print("最快调度时间: {:.6f} 秒".format(np.min(schedule_times)))
+    print("最慢调度时间: {:.6f} 秒".format(np.max(schedule_times)))
+
     print("平均每轮聚合时间: {:.4f} 秒/epoch".format(np.mean(agg_times)))
     print("最快聚合时间: {:.4f} 秒".format(np.min(agg_times)))
     print("最慢聚合时间: {:.4f} 秒".format(np.max(agg_times)))
@@ -380,6 +483,12 @@ if __name__ == '__main__':
 
     np.save(os.path.join(SAVE_DIR, "single_agg_times.npy"), np.array(agg_times))
     print("single_agg_times.npy 已保存")
+
+    np.save(os.path.join(SAVE_DIR, "single_local_train_times.npy"), np.array(local_train_times))
+    print("single_local_train_times.npy 已保存")
+
+    np.save(os.path.join(SAVE_DIR, "single_schedule_times.npy"), np.array(schedule_times))
+    print("single_schedule_times.npy 已保存")
 
     # loss 曲线
     plt.figure()
@@ -402,18 +511,36 @@ if __name__ == '__main__':
     np.save(os.path.join(SAVE_DIR, "single_convergence.npy"), np.array(acc_curve))
     print("single_convergence.npy 已保存")
 
+    np.save(os.path.join(SAVE_DIR, "single_time_detail.npy"), single_time_detail, allow_pickle=True)
+    print("single_time_detail.npy 已保存")
+
     single_time_summary = {
         "device": device_type,
         "data_prepare_time_sec": float(data_prepare_time),
+
         "single_train_time_sec": float(total_train_time),
         "single_train_outer_time_sec": float(single_train_total_time),
+
         "avg_epoch_time_sec": float(np.mean(epoch_times)),
         "min_epoch_time_sec": float(np.min(epoch_times)),
         "max_epoch_time_sec": float(np.max(epoch_times)),
+        "total_epoch_time_sec": float(np.sum(epoch_times)),
+
+        "avg_local_train_time_sec": float(np.mean(local_train_times)),
+        "min_local_train_time_sec": float(np.min(local_train_times)),
+        "max_local_train_time_sec": float(np.max(local_train_times)),
+        "total_local_train_time_sec": float(np.sum(local_train_times)),
+
+        "avg_schedule_time_sec": float(np.mean(schedule_times)),
+        "min_schedule_time_sec": float(np.min(schedule_times)),
+        "max_schedule_time_sec": float(np.max(schedule_times)),
+        "total_schedule_time_sec": float(np.sum(schedule_times)),
+
         "avg_agg_time_sec": float(np.mean(agg_times)),
         "min_agg_time_sec": float(np.min(agg_times)),
         "max_agg_time_sec": float(np.max(agg_times)),
         "total_agg_time_sec": float(np.sum(agg_times)),
+
         "final_train_acc": float(acc_train),
         "final_test_acc": float(acc_test)
     }
@@ -463,7 +590,17 @@ if __name__ == '__main__':
             else:
                 dict_users_run = copy.deepcopy(dict_users)
 
-            _, _, acc_curve_run, epoch_times_run, agg_times_run, total_time_run = train_federated(
+            (
+                _,
+                _,
+                acc_curve_run,
+                epoch_times_run,
+                agg_times_run,
+                local_train_times_run,
+                schedule_times_run,
+                total_time_run,
+                time_detail_run
+            ) = train_federated(
                 args=args,
                 dataset_train=dataset_train,
                 dataset_test=dataset_test,
@@ -576,7 +713,17 @@ if __name__ == '__main__':
                 pair_start = time.time()
                 print("alpha={}, frac={}, run={}".format(alpha_fixed, frac, run + 1))
 
-                _, _, acc_curve_run, epoch_times_run, agg_times_run, total_time_run = train_federated(
+                (
+                    _,
+                    _,
+                    acc_curve_run,
+                    epoch_times_run,
+                    agg_times_run,
+                    local_train_times_run,
+                    schedule_times_run,
+                    total_time_run,
+                    time_detail_run
+                ) = train_federated(
                     args=args,
                     dataset_train=dataset_train,
                     dataset_test=dataset_test,
@@ -658,6 +805,10 @@ if __name__ == '__main__':
         "multi_alpha_time_sec": float(multi_alpha_total_time),
         "multi_alpha_frac_time_sec": float(multi_alpha_frac_total_time),
         "program_total_time_sec": float(program_total_time),
+
+        "single_total_epoch_time_sec": float(np.sum(epoch_times)),
+        "single_total_local_train_time_sec": float(np.sum(local_train_times)),
+        "single_total_schedule_time_sec": float(np.sum(schedule_times)),
         "single_total_agg_time_sec": float(np.sum(agg_times))
     }
     np.save(os.path.join(SAVE_DIR, "overall_time_summary.npy"), overall_time_summary)
