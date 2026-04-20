@@ -355,60 +355,33 @@ if __name__ == '__main__':
     print("当前设备:", device_type)
     print("device =", args.device)
 
-    # ===== 读取数据 =====
+    # ===== 读取数据（synthetic only） =====
     data_prepare_start = time.time()
 
-    if args.dataset == 'mnist':
-        trans_mnist = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        dataset_train = datasets.MNIST('../data/mnist/', train=True, download=True, transform=trans_mnist)
-        dataset_test = datasets.MNIST('../data/mnist/', train=False, download=True, transform=trans_mnist)
+    if args.dataset != 'synthetic':
+        raise ValueError("本版本只支持 synthetic 实验，请使用 --dataset synthetic")
 
-        if args.iid:
-            dict_users = mnist_iid(dataset_train, args.num_users)
-        else:
-            dict_users = mnist_noniid(dataset_train, args.num_users)
+    experiment_seed = 0
 
-    elif args.dataset == 'cifar':
-        trans_cifar = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-        dataset_train = datasets.CIFAR10('../data/cifar', train=True, download=True, transform=trans_cifar)
-        dataset_test = datasets.CIFAR10('../data/cifar', train=False, download=True, transform=trans_cifar)
+    dataset_train = torch.load(
+        os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}.pt"),
+        weights_only=False
+    )
+    dataset_test = torch.load(
+        os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"),
+        weights_only=False
+    )
 
-        if args.iid:
-            dict_users = cifar_iid(dataset_train, args.num_users)
-        else:
-            raise ValueError("当前代码未为 CIFAR 写 Dirichlet 非IID 划分，可先用 synthetic 或 mnist")
-
-    elif args.dataset == 'synthetic':
-        experiment_seed = 0
-
-        dataset_train = torch.load(
-            os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}.pt"),
-            weights_only=False
-        )
-        dataset_test = torch.load(
-            os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"),
-            weights_only=False
-        )
-
-        if args.iid:
-            dict_users = np.load(
-                os.path.join(FAIR_DIR, f"dict_users_iid_seed{experiment_seed}.npy"),
-                allow_pickle=True
-            ).item()
-        else:
-            dict_users = np.load(
-                os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
-                allow_pickle=True
-            ).item()
-
+    if args.iid:
+        dict_users = np.load(
+            os.path.join(FAIR_DIR, f"dict_users_iid_seed{experiment_seed}.npy"),
+            allow_pickle=True
+        ).item()
     else:
-        exit('Error: unrecognized dataset')
+        dict_users = np.load(
+            os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
+            allow_pickle=True
+        ).item()
 
     data_prepare_time = time.time() - data_prepare_start
     print("数据准备完成，用时: {:.2f} 秒".format(data_prepare_time))
