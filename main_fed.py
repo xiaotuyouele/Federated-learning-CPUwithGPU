@@ -261,7 +261,19 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
         # 3) 聚合时间
         # =====================
         agg_start_time = time.time()
+
+        # 只在第1轮打印一次设备信息，避免刷屏
+        if epoch == 0 and len(w_locals) > 0:
+            first_key = list(w_locals[0].keys())[0]
+            print("聚合前首个客户端参数设备:", w_locals[0][first_key].device)
+            print("聚合前全局模型参数设备:", next(net_glob.parameters()).device)
+
         w_glob = FedAvg(w_locals)
+
+        if epoch == 0:
+            first_key = list(w_glob.keys())[0]
+            print("聚合后参数设备:", w_glob[first_key].device)
+
         net_glob.load_state_dict(w_glob)
         agg_time = time.time() - agg_start_time
         agg_times.append(agg_time)
