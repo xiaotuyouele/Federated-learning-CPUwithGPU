@@ -4,7 +4,6 @@
 import copy
 import torch
 
-
 def FedAvg(w):
     if len(w) == 0:
         raise ValueError("FedAvg received empty weights list")
