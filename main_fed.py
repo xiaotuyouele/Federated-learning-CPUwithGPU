@@ -248,11 +248,11 @@ def train_federated(args, dataset_train, dataset_test, dict_users, img_size,
             w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
 
             if all_clients_flag:
-                w_locals[idx] = copy.deepcopy(w)
+                w_locals[idx] = w
             else:
-                w_locals.append(copy.deepcopy(w))
+                w_locals.append(w)
 
-            loss_locals.append(copy.deepcopy(loss))
+            loss_locals.append(loss)
 
         local_train_time = time.time() - local_train_start_time
         local_train_times.append(local_train_time)
