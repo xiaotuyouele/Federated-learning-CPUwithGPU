@@ -37,6 +37,98 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def trusted_torch_load(path, map_location=None):
+    return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def find_existing_file(base_path_without_ext, exts):
+    for ext in exts:
+        full_path = base_path_without_ext + ext
+        if os.path.exists(full_path):
+            return full_path
+    return None
+
+
+def load_fair_dataset_pair(experiment_seed):
+    train_path = find_existing_file(
+        os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}"),
+        [".pt", ".pth"]
+    )
+    test_path = find_existing_file(
+        os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}"),
+        [".pt", ".pth"]
+    )
+
+    if train_path is None:
+        raise FileNotFoundError(
+            f"未找到 dataset_train_seed{experiment_seed}.pt/.pth，请检查 {FAIR_DIR}"
+        )
+    if test_path is None:
+        raise FileNotFoundError(
+            f"未找到 dataset_test_seed{experiment_seed}.pt/.pth，请检查 {FAIR_DIR}"
+        )
+
+    dataset_train = trusted_torch_load(train_path)
+    dataset_test = trusted_torch_load(test_path)
+    return dataset_train, dataset_test
+
+
+def load_fair_dict_users(experiment_seed, iid=False):
+    candidate_names = []
+    if iid:
+        candidate_names = [
+            f"dict_users_iid_seed{experiment_seed}.npy",
+            f"dict_users_iid_seed{experiment_seed}.pt",
+            f"dict_users_iid_seed{experiment_seed}.pth"
+        ]
+    else:
+        candidate_names = [
+            f"dict_users_seed{experiment_seed}.npy",
+            f"dict_users_seed{experiment_seed}.pt",
+            f"dict_users_seed{experiment_seed}.pth"
+        ]
+
+    for filename in candidate_names:
+        path = os.path.join(FAIR_DIR, filename)
+        if os.path.exists(path):
+            if path.endswith(".npy"):
+                return np.load(path, allow_pickle=True).item()
+            return trusted_torch_load(path)
+
+    raise FileNotFoundError(
+        f"未找到 {'dict_users_iid' if iid else 'dict_users'}_seed{experiment_seed} 文件，请检查 {FAIR_DIR}"
+    )
+
+
+def load_fair_client_schedule(experiment_seed):
+    npy_path = os.path.join(FAIR_DIR, f"client_schedule_seed{experiment_seed}.npy")
+    pt_path = os.path.join(FAIR_DIR, f"client_schedule_seed{experiment_seed}.pt")
+    pth_path = os.path.join(FAIR_DIR, f"client_schedule_seed{experiment_seed}.pth")
+
+    if os.path.exists(npy_path):
+        return np.load(npy_path, allow_pickle=True)
+    elif os.path.exists(pt_path):
+        return trusted_torch_load(pt_path)
+    elif os.path.exists(pth_path):
+        return trusted_torch_load(pth_path)
+    else:
+        raise FileNotFoundError(
+            f"未找到 client_schedule_seed{experiment_seed}.npy/.pt/.pth，请检查 {FAIR_DIR}"
+        )
+
+
+def load_fair_init_state(experiment_seed, map_location=None):
+    init_path = find_existing_file(
+        os.path.join(FAIR_DIR, f"init_model_seed{experiment_seed}"),
+        [".pt", ".pth"]
+    )
+    if init_path is None:
+        raise FileNotFoundError(
+            f"未找到 init_model_seed{experiment_seed}.pt/.pth，请检查 {FAIR_DIR}"
+        )
+    return trusted_torch_load(init_path, map_location=map_location)
+
+
 def generate_synthetic_dataset(args, seed=0):
     set_seed(seed)
 
@@ -164,60 +256,30 @@ def build_model(args, img_size, device):
     raise ValueError('Error: unrecognized model')
 
 
-def move_state_dict_to_device(state_dict, device):
-    """
-    将 state_dict 中所有张量移动到指定设备
-    """
-    moved = {}
-    for k, v in state_dict.items():
-        moved[k] = v.to(device)
-    return moved
-
-
-def average_weights_on_gpu(w_locals, gpu_device):
-    """
-    在 GPU 上执行 FedAvg：
-    输入：
-        w_locals: list[dict]，每个 dict 是一个客户端模型参数（当前通常在 CPU）
-    输出：
-        w_avg_gpu: dict，聚合后的参数（在 GPU 上）
-    """
-    if len(w_locals) == 0:
-        raise ValueError("w_locals 为空，无法聚合")
-
-    # 先把第一个客户端参数搬到 GPU，作为累加器初始化
-    w_avg_gpu = {}
-    for k in w_locals[0].keys():
-        w_avg_gpu[k] = w_locals[0][k].detach().to(gpu_device).clone()
-
-    # 累加其余客户端参数
-    for i in range(1, len(w_locals)):
-        for k in w_avg_gpu.keys():
-            w_avg_gpu[k] += w_locals[i][k].detach().to(gpu_device)
-
-    # 求平均
-    num_clients = len(w_locals)
-    for k in w_avg_gpu.keys():
-        w_avg_gpu[k] = torch.div(w_avg_gpu[k], num_clients)
-
-    return w_avg_gpu
+def clone_state_dict(state_dict):
+    return {k: v.detach().clone() for k, v in state_dict.items()}
 
 
 # =========================================================
-# 训练函数：终稿对齐协同版
-# CPU：调度 + 本地训练 + 全局模型更新
-# GPU：聚合
+# 训练函数：方向一公平协同版
+# CPU：调度 + 控制 + 记录
+# GPU：本地训练 + 聚合 + 全局模型保持
 # =========================================================
 def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, img_size,
                                 client_schedule, experiment_seed,
                                 frac=None, all_clients_flag=None, verbose=True):
     """
-    终稿对齐版 CPU+GPU 协同训练：
-    - CPU：调度、本地训练、控制逻辑、全局模型更新
-    - GPU：高维参数聚合
+    方向一公平协同版：
+    - CPU：调度、流程控制、日志统计
+    - GPU：本地训练、参数聚合、全局模型常驻
+
+    公平性保证：
+    1) 与 CPU / GPU 版使用同一份 fair_experiment 数据、init_model、client_schedule
+    2) 相同 epochs / frac / alpha / runs / seed 规则
+    3) 相同模型结构、相同本地训练逻辑、相同 Dirichlet 划分逻辑
 
     返回：
-    - 最终模型 net_glob（CPU）
+    - 最终模型 net_glob（GPU 上）
     - loss 曲线
     - acc 曲线
     - epoch_times
@@ -235,32 +297,23 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     if all_clients_flag is None:
         all_clients_flag = args.all_clients
 
-    # -------------------------
-    # 设备定义：协同版固定口径
-    # -------------------------
     cpu_device = torch.device('cpu')
     gpu_device = torch.device(
         'cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu'
     )
 
     if verbose:
-        print("========== Cooperative mode ==========")
+        print("========== Cooperative mode (Direction 1) ==========")
         print("调度设备: CPU")
-        print("本地训练设备: CPU")
+        print("本地训练设备: {}".format(gpu_device))
         print("聚合设备: {}".format(gpu_device))
-        print("全局模型更新设备: CPU")
+        print("全局模型更新设备: {}".format(gpu_device))
 
-    # 全局模型始终维护在 CPU，和终稿一致
-    net_glob = build_model(args, img_size, cpu_device)
-
-    init_state = torch.load(
-        os.path.join(FAIR_DIR, f"init_model_seed{experiment_seed}.pth"),
-        map_location=cpu_device
-    )
+    # 全局模型常驻 GPU，避免每轮来回搬运
+    net_glob = build_model(args, img_size, gpu_device)
+    init_state = load_fair_init_state(experiment_seed, map_location=gpu_device)
     net_glob.load_state_dict(init_state)
-
     net_glob.train()
-    w_glob = copy.deepcopy(net_glob.state_dict())  # CPU 上
 
     loss_train = []
     acc_curve = []
@@ -272,11 +325,11 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     transfer_to_cpu_times = []
 
     time_detail = {
-        "mode": "CPU_train_GPU_agg",
+        "mode": "CPU_schedule_GPU_train_GPU_agg",
         "schedule_device": "CPU",
-        "local_train_device": "CPU",
+        "local_train_device": str(gpu_device),
         "agg_device": str(gpu_device),
-        "global_update_device": "CPU",
+        "global_update_device": str(gpu_device),
 
         "epoch_times_sec": [],
         "agg_times_sec": [],
@@ -286,6 +339,9 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
         "transfer_to_cpu_times_sec": [],
         "selected_clients_per_epoch": [],
     }
+
+    old_global_device = args.device
+    args.device = gpu_device
 
     train_start_time = time.time()
 
@@ -309,64 +365,54 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
         schedule_times.append(schedule_time)
 
         # =====================================================
-        # 2) 本地训练（CPU）
+        # 2) 全局模型仅在开始时已在 GPU，这里口径上保留传输项
+        # =====================================================
+        transfer_to_gpu_start = time.time()
+        if gpu_device.type == "cuda":
+            torch.cuda.synchronize(gpu_device)
+        transfer_to_gpu_time = time.time() - transfer_to_gpu_start
+        transfer_to_gpu_times.append(transfer_to_gpu_time)
+
+        # =====================================================
+        # 3) 本地训练（GPU）
         # =====================================================
         local_train_start_time = time.time()
 
         w_locals = []
+        global_state_gpu = clone_state_dict(net_glob.state_dict())
 
         for idx in idxs_users:
-            # 关键：协同版把本地训练设备强制固定到 CPU
-            old_device = args.device
-            args.device = cpu_device
+            local_net = build_model(args, img_size, gpu_device)
+            local_net.load_state_dict(global_state_gpu)
 
             local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
-            w, loss = local.train(net=copy.deepcopy(net_glob).to(cpu_device))
+            w, loss = local.train(net=local_net)
 
-            args.device = old_device
-
-            # 保证每个客户端参数都留在 CPU，符合“CPU训练 -> GPU聚合”
-            w_cpu = move_state_dict_to_device(w, cpu_device)
-            w_locals.append(w_cpu)
+            w_gpu = {k: v.detach().clone() for k, v in w.items()}
+            w_locals.append(w_gpu)
             loss_locals.append(loss)
+
+        if gpu_device.type == "cuda":
+            torch.cuda.synchronize(gpu_device)
 
         local_train_time = time.time() - local_train_start_time
         local_train_times.append(local_train_time)
 
         # =====================================================
-        # 3) CPU -> GPU 传输 + GPU 聚合
+        # 4) GPU 聚合（不再回 CPU）
         # =====================================================
-        transfer_to_gpu_start = time.time()
-
-        # 这里不预先整体搬一遍，而是在 average_weights_on_gpu 中逐个层搬到 GPU。
-        # 为了计时一致性，这里只记录开始时间，到聚合真正开始前结束。
-        # 这样可以把“传输到GPU”与“GPU聚合”分开统计。
-        # 实际上，average_weights_on_gpu 内部也包含搬运动作。
-        # 这里采用“显式预搬运”以便统计更清楚。
-        w_locals_gpu_ready = []
-        for w in w_locals:
-            w_gpu = {}
-            for k, v in w.items():
-                w_gpu[k] = v.detach().to(gpu_device)
-            w_locals_gpu_ready.append(w_gpu)
-
-        if gpu_device.type == "cuda":
-            torch.cuda.synchronize(gpu_device)
-
-        transfer_to_gpu_time = time.time() - transfer_to_gpu_start
-        transfer_to_gpu_times.append(transfer_to_gpu_time)
-
         agg_start_time = time.time()
 
-        # 在 GPU 上聚合
-        if len(w_locals_gpu_ready) == 0:
+        if len(w_locals) == 0:
             raise ValueError("本轮没有客户端上传参数，无法聚合")
 
-        w_glob_gpu = copy.deepcopy(w_locals_gpu_ready[0])
+        w_glob_gpu = clone_state_dict(w_locals[0])
         for k in w_glob_gpu.keys():
-            for i in range(1, len(w_locals_gpu_ready)):
-                w_glob_gpu[k] += w_locals_gpu_ready[i][k]
-            w_glob_gpu[k] = torch.div(w_glob_gpu[k], len(w_locals_gpu_ready))
+            for i in range(1, len(w_locals)):
+                w_glob_gpu[k] += w_locals[i][k]
+            w_glob_gpu[k] = torch.div(w_glob_gpu[k], len(w_locals))
+
+        net_glob.load_state_dict(w_glob_gpu)
 
         if gpu_device.type == "cuda":
             torch.cuda.synchronize(gpu_device)
@@ -375,50 +421,31 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
         agg_times.append(agg_time)
 
         # =====================================================
-        # 4) GPU -> CPU 回传 + CPU 更新全局模型
+        # 5) GPU -> CPU 回传（方向一中间过程不回传，记极小值）
         # =====================================================
         transfer_to_cpu_start = time.time()
-
-        w_glob_cpu = {}
-        for k, v in w_glob_gpu.items():
-            w_glob_cpu[k] = v.detach().to(cpu_device)
-
         if gpu_device.type == "cuda":
             torch.cuda.synchronize(gpu_device)
-
         transfer_to_cpu_time = time.time() - transfer_to_cpu_start
         transfer_to_cpu_times.append(transfer_to_cpu_time)
 
-        # CPU 更新全局模型
-        w_glob = w_glob_cpu
-        net_glob.load_state_dict(w_glob)
-
         # =====================================================
-        # 5) loss / acc
+        # 6) loss / acc（测试也放 GPU，避免每轮来回传）
         # =====================================================
         loss_avg = sum(loss_locals) / len(loss_locals)
         loss_train.append(loss_avg)
 
         net_glob.eval()
-
-        # test_img 依赖 args.device，这里测试也固定在 CPU，保证终稿口径统一
-        old_device = args.device
-        args.device = cpu_device
         acc_test, _ = test_img(net_glob, dataset_test, args)
-        args.device = old_device
-
         acc_curve.append(acc_test)
         net_glob.train()
 
         # =====================================================
-        # 6) 本轮总时间
+        # 7) 本轮总时间
         # =====================================================
         epoch_time = time.time() - epoch_start_time
         epoch_times.append(epoch_time)
 
-        # =====================================================
-        # 7) 记录详细时间
-        # =====================================================
         time_detail["epoch_times_sec"].append(float(epoch_time))
         time_detail["agg_times_sec"].append(float(agg_time))
         time_detail["local_train_times_sec"].append(float(local_train_time))
@@ -431,7 +458,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
             print(
                 "Round {:3d}, clients {:3d}, Average loss {:.4f}, Test accuracy {:.4f}, "
                 "Epoch Time {:.2f}s, Local Train {:.2f}s, Schedule {:.6f}s, "
-                "CPU->GPU {:.4f}s, GPU Agg {:.4f}s, GPU->CPU {:.4f}s".format(
+                "CPU->GPU {:.6f}s, GPU Agg {:.4f}s, GPU->CPU {:.6f}s".format(
                     epoch + 1,
                     len(idxs_users),
                     loss_avg,
@@ -446,6 +473,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
             )
 
     total_train_time = time.time() - train_start_time
+    args.device = old_global_device
 
     time_detail["total_train_time_sec"] = float(total_train_time)
 
@@ -477,7 +505,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     time_detail["max_transfer_to_cpu_time_sec"] = float(np.max(transfer_to_cpu_times))
 
     return (
-        net_glob,                    # CPU
+        net_glob,                    # GPU
         loss_train,
         acc_curve,
         epoch_times,
@@ -499,7 +527,6 @@ if __name__ == '__main__':
     args.epochs = 20
     print("args.epochs =", args.epochs)
 
-    # 这里只保留“可用GPU信息”，但协同版内部会显式区分 CPU / GPU
     args.device = torch.device(
         'cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu'
     )
@@ -511,11 +538,11 @@ if __name__ == '__main__':
     cooperative_gpu_device = torch.device(
         'cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu'
     )
-    print("========== 终稿对齐协同模式 ==========")
+    print("========== 方向一公平协同模式 ==========")
     print("调度设备: CPU")
-    print("本地训练设备: CPU")
+    print("本地训练设备:", cooperative_gpu_device)
     print("聚合设备:", cooperative_gpu_device)
-    print("全局模型更新设备: CPU")
+    print("全局模型更新设备:", cooperative_gpu_device)
 
     # ===== 读取数据（synthetic only） =====
     data_prepare_start = time.time()
@@ -525,37 +552,15 @@ if __name__ == '__main__':
 
     experiment_seed = 0
 
-    dataset_train = torch.load(
-        os.path.join(FAIR_DIR, f"dataset_train_seed{experiment_seed}.pt"),
-        weights_only=False
-    )
-    dataset_test = torch.load(
-        os.path.join(FAIR_DIR, f"dataset_test_seed{experiment_seed}.pt"),
-        weights_only=False
-    )
-
-    if args.iid:
-        dict_users = np.load(
-            os.path.join(FAIR_DIR, f"dict_users_iid_seed{experiment_seed}.npy"),
-            allow_pickle=True
-        ).item()
-    else:
-        dict_users = np.load(
-            os.path.join(FAIR_DIR, f"dict_users_seed{experiment_seed}.npy"),
-            allow_pickle=True
-        ).item()
+    dataset_train, dataset_test = load_fair_dataset_pair(experiment_seed)
+    dict_users = load_fair_dict_users(experiment_seed, iid=args.iid)
+    client_schedule_fixed = load_fair_client_schedule(experiment_seed)
+    fixed_experiment_seed = experiment_seed
 
     data_prepare_time = time.time() - data_prepare_start
     print("数据准备完成，用时: {:.2f} 秒".format(data_prepare_time))
 
     img_size = dataset_train[0][0].shape
-
-    # ===== 固定公平实验资源 =====
-    fixed_experiment_seed = 0
-    client_schedule_fixed = np.load(
-        os.path.join(FAIR_DIR, "client_schedule_seed0.npy"),
-        allow_pickle=True
-    )
 
     # ===== 打印客户端样本量 =====
     print("========== Client sample statistics ==========")
@@ -565,7 +570,7 @@ if __name__ == '__main__':
     # =========================================================
     # 0) 单次训练
     # =========================================================
-    print("\n========== Single training (CPU train + GPU agg) ==========")
+    print("\n========== Single training (CPU schedule + GPU train + GPU agg) ==========")
     single_train_start = time.time()
 
     (
@@ -611,9 +616,9 @@ if __name__ == '__main__':
     print("最快调度时间: {:.6f} 秒".format(np.min(schedule_times)))
     print("最慢调度时间: {:.6f} 秒".format(np.max(schedule_times)))
 
-    print("平均每轮 CPU->GPU 传输时间: {:.4f} 秒/epoch".format(np.mean(transfer_to_gpu_times)))
+    print("平均每轮 CPU->GPU 传输时间: {:.6f} 秒/epoch".format(np.mean(transfer_to_gpu_times)))
     print("平均每轮 GPU 聚合时间: {:.4f} 秒/epoch".format(np.mean(agg_times)))
-    print("平均每轮 GPU->CPU 回传时间: {:.4f} 秒/epoch".format(np.mean(transfer_to_cpu_times)))
+    print("平均每轮 GPU->CPU 回传时间: {:.6f} 秒/epoch".format(np.mean(transfer_to_cpu_times)))
 
     np.save(os.path.join(SAVE_DIR, "single_epoch_times.npy"), np.array(epoch_times))
     print("single_epoch_times.npy 已保存")
@@ -644,10 +649,10 @@ if __name__ == '__main__':
     ))
     plt.close()
 
-    # 测试：协同版口径下测试也固定在 CPU
-    old_device = args.device
-    args.device = torch.device('cpu')
+    # 测试保持在 GPU，避免不必要的回传
     net_glob.eval()
+    old_device = args.device
+    args.device = cooperative_gpu_device
     acc_train, loss_train_eval = test_img(net_glob, dataset_train, args)
     acc_test, loss_test = test_img(net_glob, dataset_test, args)
     args.device = old_device
@@ -662,8 +667,8 @@ if __name__ == '__main__':
     print("single_time_detail.npy 已保存")
 
     single_time_summary = {
-        "mode": "CPU_train_GPU_agg",
-        "device": "Cooperative",
+        "mode": "CPU_schedule_GPU_train_GPU_agg",
+        "device": "Cooperative_Direction1",
 
         "data_prepare_time_sec": float(data_prepare_time),
 
@@ -826,7 +831,7 @@ if __name__ == '__main__':
         print("α={}, mean_agg_time={:.4f}s, std_agg_time={:.4f}s".format(
             alpha, alpha_agg_time_results[alpha][0], alpha_agg_time_results[alpha][1]
         ))
-        print("α={}, mean_cpu_to_gpu={:.4f}s, mean_gpu_to_cpu={:.4f}s".format(
+        print("α={}, mean_cpu_to_gpu={:.6f}s, mean_gpu_to_cpu={:.6f}s".format(
             alpha, alpha_transfer_to_gpu_results[alpha][0], alpha_transfer_to_cpu_results[alpha][0]
         ))
 
@@ -997,8 +1002,8 @@ if __name__ == '__main__':
 
     program_total_time = time.time() - program_start_time
     overall_time_summary = {
-        "mode": "CPU_train_GPU_agg",
-        "device": "Cooperative",
+        "mode": "CPU_schedule_GPU_train_GPU_agg",
+        "device": "Cooperative_Direction1",
 
         "data_prepare_time_sec": float(data_prepare_time),
         "single_training_block_time_sec": float(single_train_total_time),
