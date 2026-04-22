@@ -261,15 +261,18 @@ def clone_state_dict(state_dict):
 
 
 # =========================================================
-# 训练函数：方向一公平协同版
+# 训练函数：方向一公平协同版（优化版）
 # CPU：调度 + 控制 + 记录
 # GPU：本地训练 + 聚合 + 全局模型保持
+# 优化点：
+# 1) local_net 循环外复用
+# 2) 边训练边累加，不再保存整轮 w_locals
 # =========================================================
 def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, img_size,
                                 client_schedule, experiment_seed,
                                 frac=None, all_clients_flag=None, verbose=True):
     """
-    方向一公平协同版：
+    方向一公平协同版（优化版）：
     - CPU：调度、流程控制、日志统计
     - GPU：本地训练、参数聚合、全局模型常驻
 
@@ -277,19 +280,6 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     1) 与 CPU / GPU 版使用同一份 fair_experiment 数据、init_model、client_schedule
     2) 相同 epochs / frac / alpha / runs / seed 规则
     3) 相同模型结构、相同本地训练逻辑、相同 Dirichlet 划分逻辑
-
-    返回：
-    - 最终模型 net_glob（GPU 上）
-    - loss 曲线
-    - acc 曲线
-    - epoch_times
-    - agg_times
-    - local_train_times
-    - schedule_times
-    - transfer_to_gpu_times
-    - transfer_to_cpu_times
-    - total_train_time
-    - time_detail
     """
 
     if frac is None:
@@ -303,13 +293,13 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     )
 
     if verbose:
-        print("========== Cooperative mode (Direction 1) ==========")
+        print("========== Cooperative mode (Direction 1, optimized) ==========")
         print("调度设备: CPU")
         print("本地训练设备: {}".format(gpu_device))
         print("聚合设备: {}".format(gpu_device))
         print("全局模型更新设备: {}".format(gpu_device))
 
-    # 全局模型常驻 GPU，避免每轮来回搬运
+    # 全局模型常驻 GPU
     net_glob = build_model(args, img_size, gpu_device)
     init_state = load_fair_init_state(experiment_seed, map_location=gpu_device)
     net_glob.load_state_dict(init_state)
@@ -325,7 +315,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     transfer_to_cpu_times = []
 
     time_detail = {
-        "mode": "CPU_schedule_GPU_train_GPU_agg",
+        "mode": "CPU_schedule_GPU_train_GPU_agg_optimized",
         "schedule_device": "CPU",
         "local_train_device": str(gpu_device),
         "agg_device": str(gpu_device),
@@ -344,6 +334,9 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     args.device = gpu_device
 
     train_start_time = time.time()
+
+    # 复用本地模型，避免每个 client 都重新 build_model
+    local_net = build_model(args, img_size, gpu_device)
 
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
@@ -365,7 +358,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
         schedule_times.append(schedule_time)
 
         # =====================================================
-        # 2) 全局模型仅在开始时已在 GPU，这里口径上保留传输项
+        # 2) 全局模型已在 GPU，保留口径
         # =====================================================
         transfer_to_gpu_start = time.time()
         if gpu_device.type == "cuda":
@@ -375,21 +368,26 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
 
         # =====================================================
         # 3) 本地训练（GPU）
+        #    优化：边训练边累计，不再保存整轮 w_locals
         # =====================================================
         local_train_start_time = time.time()
 
-        w_locals = []
         global_state_gpu = clone_state_dict(net_glob.state_dict())
+        w_sum = None
 
         for idx in idxs_users:
-            local_net = build_model(args, img_size, gpu_device)
+            # 复用模型，只重载参数
             local_net.load_state_dict(global_state_gpu)
 
             local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
             w, loss = local.train(net=local_net)
 
-            w_gpu = {k: v.detach().clone() for k, v in w.items()}
-            w_locals.append(w_gpu)
+            if w_sum is None:
+                w_sum = {k: v.detach().clone() for k, v in w.items()}
+            else:
+                for k in w_sum.keys():
+                    w_sum[k] += w[k].detach()
+
             loss_locals.append(loss)
 
         if gpu_device.type == "cuda":
@@ -399,18 +397,17 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
         local_train_times.append(local_train_time)
 
         # =====================================================
-        # 4) GPU 聚合（不再回 CPU）
+        # 4) GPU 聚合
         # =====================================================
         agg_start_time = time.time()
 
-        if len(w_locals) == 0:
+        if w_sum is None:
             raise ValueError("本轮没有客户端上传参数，无法聚合")
 
-        w_glob_gpu = clone_state_dict(w_locals[0])
-        for k in w_glob_gpu.keys():
-            for i in range(1, len(w_locals)):
-                w_glob_gpu[k] += w_locals[i][k]
-            w_glob_gpu[k] = torch.div(w_glob_gpu[k], len(w_locals))
+        w_glob_gpu = {}
+        num_selected = len(idxs_users)
+        for k in w_sum.keys():
+            w_glob_gpu[k] = torch.div(w_sum[k], num_selected)
 
         net_glob.load_state_dict(w_glob_gpu)
 
@@ -430,7 +427,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
         transfer_to_cpu_times.append(transfer_to_cpu_time)
 
         # =====================================================
-        # 6) loss / acc（测试也放 GPU，避免每轮来回传）
+        # 6) loss / acc
         # =====================================================
         loss_avg = sum(loss_locals) / len(loss_locals)
         loss_train.append(loss_avg)
@@ -505,7 +502,7 @@ def train_federated_cooperative(args, dataset_train, dataset_test, dict_users, i
     time_detail["max_transfer_to_cpu_time_sec"] = float(np.max(transfer_to_cpu_times))
 
     return (
-        net_glob,                    # GPU
+        net_glob,
         loss_train,
         acc_curve,
         epoch_times,
@@ -538,7 +535,7 @@ if __name__ == '__main__':
     cooperative_gpu_device = torch.device(
         'cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu'
     )
-    print("========== 方向一公平协同模式 ==========")
+    print("========== 方向一公平协同模式（优化版） ==========")
     print("调度设备: CPU")
     print("本地训练设备:", cooperative_gpu_device)
     print("聚合设备:", cooperative_gpu_device)
@@ -570,7 +567,7 @@ if __name__ == '__main__':
     # =========================================================
     # 0) 单次训练
     # =========================================================
-    print("\n========== Single training (CPU schedule + GPU train + GPU agg) ==========")
+    print("\n========== Single training (CPU schedule + GPU train + GPU agg, optimized) ==========")
     single_train_start = time.time()
 
     (
@@ -649,7 +646,6 @@ if __name__ == '__main__':
     ))
     plt.close()
 
-    # 测试保持在 GPU，避免不必要的回传
     net_glob.eval()
     old_device = args.device
     args.device = cooperative_gpu_device
@@ -667,8 +663,8 @@ if __name__ == '__main__':
     print("single_time_detail.npy 已保存")
 
     single_time_summary = {
-        "mode": "CPU_schedule_GPU_train_GPU_agg",
-        "device": "Cooperative_Direction1",
+        "mode": "CPU_schedule_GPU_train_GPU_agg_optimized",
+        "device": "Cooperative_Direction1_Optimized",
 
         "data_prepare_time_sec": float(data_prepare_time),
 
@@ -708,7 +704,7 @@ if __name__ == '__main__':
     print("single_time_summary.npy 已保存")
 
     # =========================================================
-    # 1) 多 α 实验：固定 frac，看 α 对最终精度和收敛曲线的影响
+    # 1) 多 α 实验
     # =========================================================
     print("\n========== Multi-alpha experiment ==========")
     multi_alpha_start = time.time()
@@ -1002,8 +998,8 @@ if __name__ == '__main__':
 
     program_total_time = time.time() - program_start_time
     overall_time_summary = {
-        "mode": "CPU_schedule_GPU_train_GPU_agg",
-        "device": "Cooperative_Direction1",
+        "mode": "CPU_schedule_GPU_train_GPU_agg_optimized",
+        "device": "Cooperative_Direction1_Optimized",
 
         "data_prepare_time_sec": float(data_prepare_time),
         "single_training_block_time_sec": float(single_train_total_time),
