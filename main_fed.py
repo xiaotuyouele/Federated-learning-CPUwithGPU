@@ -550,7 +550,26 @@ if __name__ == '__main__':
     experiment_seed = 0
 
     dataset_train, dataset_test = load_fair_dataset_pair(experiment_seed)
-    dict_users = load_fair_dict_users(experiment_seed, iid=args.iid)
+
+    # =====================================================
+    # 关键修正：IID 文件不存在时，自动生成并保存
+    # =====================================================
+    if args.iid:
+        iid_path = os.path.join(FAIR_DIR, f"dict_users_iid_seed{experiment_seed}.npy")
+        if os.path.exists(iid_path):
+            dict_users = np.load(iid_path, allow_pickle=True).item()
+            print("已读取 IID 划分文件:", iid_path)
+        else:
+            dict_users = build_iid_split(
+                dataset_train=dataset_train,
+                num_users=args.num_users,
+                seed=experiment_seed
+            )
+            np.save(iid_path, dict_users, allow_pickle=True)
+            print("未找到 IID 划分文件，已自动生成并保存:", iid_path)
+    else:
+        dict_users = load_fair_dict_users(experiment_seed, iid=False)
+
     client_schedule_fixed = load_fair_client_schedule(experiment_seed)
     fixed_experiment_seed = experiment_seed
 
@@ -702,6 +721,13 @@ if __name__ == '__main__':
     }
     np.save(os.path.join(SAVE_DIR, "single_time_summary.npy"), single_time_summary)
     print("single_time_summary.npy 已保存")
+
+    # =====================================================
+    # 关键修正：IID baseline 跑完后直接退出
+    # =====================================================
+    if args.iid:
+        print("IID baseline 已完成，跳过多α和多frac实验。")
+        exit()
 
     # =========================================================
     # 1) 多 α 实验
